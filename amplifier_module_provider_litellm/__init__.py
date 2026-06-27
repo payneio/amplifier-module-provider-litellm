@@ -57,6 +57,13 @@ class LiteLLMProvider:
         self._client = client
         self._caps: CapabilityMap | None = None
         self._max_retries = int(self._config.get("max_retries", _DEFAULT_MAX_RETRIES))
+        # Public attributes the amplifier orchestrator reads off a provider.
+        # _select_provider() picks the lowest `priority` number; without this
+        # attribute it defaults to 100 and a higher-priority native provider
+        # (e.g. anthropic) wins, so traffic never reaches the proxy.
+        self.priority = int(self._config.get("priority", 100))
+        self.default_model = self._config.get("default_model")
+        self.raw = bool(self._config.get("raw", False))
 
     # ----------------------------------------------------------------- mount
     def _ensure_client(self) -> httpx.AsyncClient:
@@ -87,6 +94,11 @@ class LiteLLMProvider:
         return self._caps
 
     # ---------------------------------------------------------------- protocol
+    @property
+    def config(self) -> dict[str, Any]:
+        """Public view of the provider config (read by the orchestrator)."""
+        return self._config
+
     @property
     def name(self) -> str:
         return "litellm"
@@ -132,6 +144,12 @@ class LiteLLMProvider:
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         return list(response.tool_calls or [])
 
+    async def close(self) -> None:
+        """Close the underlying http client (best-effort; safe to call twice)."""
+        client, self._client = self._client, None
+        if client is not None:
+            await client.aclose()
+
     # ------------------------------------------------------------------ http
     async def _post_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = self._base_url + "/v1/chat/completions"
@@ -173,7 +191,20 @@ LitellmProvider = LiteLLMProvider
 
 
 async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
-    """Entry point: build the provider and eagerly load capabilities (fail loud)."""
+    """Entry point: build the provider, load capabilities (fail loud), and
+    self-register with the coordinator.
+
+    The amplifier kernel calls mount(coordinator, config) and expects the module
+    to register itself into the coordinator via coordinator.mount("providers",
+    provider, name=...). The return value is treated as an optional cleanup
+    callable -- NOT as the provider. Returning the provider instance (and never
+    self-mounting) is why the kernel reported the provider 'missing' even though
+    mount() succeeded.
+
+    coordinator may be None for non-kernel callers (smoke test, the CLI's
+    lightweight provider_loader); in that case we skip registration and just
+    return the live provider so those paths keep working.
+    """
     config = dict(config or {})
 
     base_url = config.get("base_url") or os.environ.get("LITELLM_BASE_URL")
@@ -200,4 +231,16 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
 
     provider = LiteLLMProvider(base_url, api_key, config, client)
     await provider.init_capabilities()  # fail loud if /model/info unreachable
-    return provider
+
+    # Non-kernel callers (smoke test, CLI lightweight loader) pass coordinator=None.
+    # They use the returned provider directly and don't expect a cleanup callable.
+    if coordinator is None:
+        return provider
+
+    # Kernel path: self-register, then hand back a cleanup callable.
+    await coordinator.mount("providers", provider, name=provider.name)
+
+    async def cleanup() -> None:
+        await provider.close()
+
+    return cleanup
