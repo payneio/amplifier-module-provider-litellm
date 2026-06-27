@@ -43,21 +43,42 @@ class LiteLLMProvider:
     def __init__(
         self,
         base_url: str,
-        api_key: str,
-        config: dict[str, Any],
-        client: httpx.AsyncClient,
+        api_key: str = "",
+        config: dict[str, Any] | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
+        # Signature is deliberately compatible with the amplifier-app-cli
+        # lightweight provider loader, which instantiates the class directly as
+        # (base_url, api_key, config={}) with no http client and without calling
+        # mount()/init_capabilities(). client and caps are therefore lazy.
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
-        self._config = config
+        self._config = dict(config or {})
         self._client = client
         self._caps: CapabilityMap | None = None
-        self._max_retries = int(config.get("max_retries", _DEFAULT_MAX_RETRIES))
+        self._max_retries = int(self._config.get("max_retries", _DEFAULT_MAX_RETRIES))
 
     # ----------------------------------------------------------------- mount
+    def _ensure_client(self) -> httpx.AsyncClient:
+        """Return the http client, creating it lazily for non-mount() callers."""
+        if self._client is None:
+            timeout = float(self._config.get("request_timeout", _DEFAULT_TIMEOUT))
+            self._client = httpx.AsyncClient(
+                timeout=timeout,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+            )
+        return self._client
+
     async def init_capabilities(self) -> None:
         """Fetch the live capability map. Fail loud on error (called at mount)."""
-        self._caps = await CapabilityMap.fetch(self._client, self._base_url)
+        self._caps = await CapabilityMap.fetch(self._ensure_client(), self._base_url)
+
+    async def _ensure_caps(self) -> CapabilityMap:
+        """Lazily load the capability map (CLI model-listing path skips mount)."""
+        if self._caps is None:
+            await self.init_capabilities()
+        assert self._caps is not None
+        return self._caps
 
     @property
     def caps(self) -> CapabilityMap:
@@ -83,8 +104,9 @@ class LiteLLMProvider:
         )
 
     async def list_models(self) -> list[ModelInfo]:
+        caps = await self._ensure_caps()
         models: list[ModelInfo] = []
-        for mc in self.caps.all():
+        for mc in caps.all():
             caps_list = ["tools"]
             if mc.supports_reasoning:
                 caps_list.append("thinking")
@@ -102,7 +124,8 @@ class LiteLLMProvider:
         return models
 
     async def complete(self, request: Any, **kwargs: Any) -> ChatResponse:
-        payload = build_payload(request, self.caps, self._config, kwargs)
+        caps = await self._ensure_caps()
+        payload = build_payload(request, caps, self._config, kwargs)
         data = await self._post_completion(payload)
         return parse_response(data)
 
@@ -113,10 +136,11 @@ class LiteLLMProvider:
     async def _post_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = self._base_url + "/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self._api_key}"}
+        client = self._ensure_client()
         attempt = 0
         while True:
             try:
-                resp = await self._client.post(url, json=payload, headers=headers)
+                resp = await client.post(url, json=payload, headers=headers)
             except httpx.HTTPError as exc:
                 # Transport-level failure -> transient, retry with backoff.
                 if attempt < self._max_retries:
@@ -140,6 +164,12 @@ class LiteLLMProvider:
                 status=resp.status_code,
                 transient=is_transient_status(resp.status_code),
             )
+
+
+# amplifier-app-cli's provider_loader looks up the class by the convention
+# name `Litellm` + `Provider`. Our canonical class keeps the LiteLLM brand
+# casing, so expose an alias for the CLI's exact-match lookup.
+LitellmProvider = LiteLLMProvider
 
 
 async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
