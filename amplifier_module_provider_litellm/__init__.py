@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -57,6 +58,9 @@ class LiteLLMProvider:
         self._client = client
         self._caps: CapabilityMap | None = None
         self._max_retries = int(self._config.get("max_retries", _DEFAULT_MAX_RETRIES))
+        # Running session cost (USD), summed from each response's proxy-reported
+        # cost. Surfaced to the CLI via the "session.cost" contributor (below).
+        self._cost_total: Decimal | None = None
         # Public attributes the amplifier orchestrator reads off a provider.
         # _select_provider() picks the lowest `priority` number; without this
         # attribute it defaults to 100 and a higher-priority native provider
@@ -139,10 +143,28 @@ class LiteLLMProvider:
         caps = await self._ensure_caps()
         payload = build_payload(request, caps, self._config, kwargs)
         data = await self._post_completion(payload)
-        return parse_response(data)
+        response = parse_response(data)
+        self._accumulate_cost(response)
+        return response
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         return list(response.tool_calls or [])
+
+    def _accumulate_cost(self, response: ChatResponse) -> None:
+        """Add this response's proxy-reported cost to the running session total."""
+        cost = getattr(response.usage, "cost_usd", None) if response.usage else None
+        if cost is not None:
+            self._cost_total = (self._cost_total or Decimal("0")) + cost
+
+    def session_cost(self) -> dict[str, str] | None:
+        """Contributor for the kernel's 'session.cost' capability.
+
+        Returns the accumulated cost as a string (the CLI's cost display sums
+        these), or None when no cost data has been seen yet (shown as '?').
+        """
+        if self._cost_total is None:
+            return None
+        return {"cost_usd": str(self._cost_total)}
 
     async def close(self) -> None:
         """Close the underlying http client (best-effort; safe to call twice)."""
@@ -170,7 +192,14 @@ class LiteLLMProvider:
                 ) from exc
 
             if resp.status_code < 400:
-                return resp.json()
+                data = resp.json()
+                # LiteLLM reports per-request cost in a response header, not the
+                # body. Thread it through so parse_response can surface it on
+                # Usage.cost_usd and the session cost accumulates.
+                cost = resp.headers.get("x-litellm-response-cost")
+                if cost is not None:
+                    data["_litellm_response_cost"] = cost
+                return data
 
             # Fail loud on non-transient (e.g. 400): never silently strip-and-retry.
             if is_transient_status(resp.status_code) and attempt < self._max_retries:
@@ -239,6 +268,13 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
 
     # Kernel path: self-register, then hand back a cleanup callable.
     await coordinator.mount("providers", provider, name=provider.name)
+
+    # Surface per-session cost to the CLI's cost display (the proxy reports it
+    # per request; we accumulate and contribute it here, like the other providers).
+    if hasattr(coordinator, "register_contributor"):
+        coordinator.register_contributor(
+            "session.cost", "provider-litellm", provider.session_cost
+        )
 
     async def cleanup() -> None:
         await provider.close()

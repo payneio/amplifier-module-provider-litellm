@@ -13,6 +13,8 @@ turn (required when echoed back across a tool round-trip).
 from __future__ import annotations
 
 import json
+from decimal import Decimal
+from decimal import InvalidOperation
 from typing import Any
 
 from amplifier_core.message_models import ChatResponse
@@ -35,9 +37,27 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _parse_usage(raw: dict[str, Any] | None) -> Usage | None:
-    if not raw:
+def _to_decimal(value: Any) -> Decimal | None:
+    """Coerce a proxy-supplied cost (str/number) to Decimal; None if unparseable.
+
+    Usage.cost_usd is a Decimal field (the kernel rejects float), and LiteLLM
+    returns the cost as a header string like "0.00024".
+    """
+    if value is None:
         return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _parse_usage(
+    raw: dict[str, Any] | None, response_cost: Any = None
+) -> Usage | None:
+    cost_usd = _to_decimal(response_cost)
+    if not raw and cost_usd is None:
+        return None
+    raw = raw or {}
     details = raw.get("prompt_tokens_details") or {}
     cache_read = raw.get("cache_read_input_tokens")
     if cache_read is None:
@@ -59,6 +79,8 @@ def _parse_usage(raw: dict[str, Any] | None) -> Usage | None:
         extras["cache_read_tokens"] = int(cache_read)
     if cache_write is not None:
         extras["cache_write_tokens"] = int(cache_write)
+    if cost_usd is not None:
+        extras["cost_usd"] = cost_usd
 
     return Usage(
         input_tokens=input_tokens,
@@ -122,7 +144,7 @@ def parse_response(data: dict[str, Any]) -> ChatResponse:
     return ChatResponse(
         content=blocks,
         tool_calls=tool_calls,
-        usage=_parse_usage(data.get("usage")),
+        usage=_parse_usage(data.get("usage"), data.get("_litellm_response_cost")),
         finish_reason=choice.get("finish_reason"),
         metadata={"model": data.get("model"), "id": data.get("id")},
     )
